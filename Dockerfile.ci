@@ -1,0 +1,8 @@
+# CI-only image: the workflow builds a static musl binary on the runner
+# (where the cargo cache lives), so this is just a copy — seconds, not minutes.
+# For a self-contained build without a Rust toolchain, use ./Dockerfile instead.
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY dist/search /usr/local/bin/search
+ENV PORT=8080 HOST=0.0.0.0
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/search"]

@@ -1,3 +1,5 @@
 /target
+/dist
 .env
 .DS_Store
+.musl-test-binary

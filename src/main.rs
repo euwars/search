@@ -17,6 +17,11 @@ use crate::config::Config;
 use crate::handlers::{AppState, Stats, health, require_key, search};
 use crate::parallel::ParallelClient;
 
+// Faster multi-threaded allocation than glibc malloc, and essential on musl
+// (static builds), whose allocator degrades badly under thread contention.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     // Bunny Magic Containers expose the host's cores (often 32+) to the
     // container; an IO-bound proxy needs far fewer workers than that.
