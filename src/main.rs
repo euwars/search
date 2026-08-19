@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::cache::SearchCache;
 use crate::config::Config;
-use crate::handlers::{AppState, Stats, health, require_key, search};
+use crate::handlers::{AppState, Stats, empty_error, health, require_key, search};
 use crate::parallel::ParallelClient;
 
 // Faster multi-threaded allocation than glibc malloc, and essential on musl
@@ -97,6 +97,9 @@ async fn run() {
         cdn_cache = ?config.cdn_cache,
         "starting search cache"
     );
+    let service =
+        Service::new(router).catcher(salvo::catcher::Catcher::default().hoop(empty_error));
+
     let bind = config.bind.clone();
     let acceptor = TcpListener::new(bind).bind().await;
     let server = Server::new(acceptor);
@@ -108,7 +111,7 @@ async fn run() {
         handle.stop_graceful(Duration::from_secs(10));
     });
 
-    server.serve(router).await;
+    server.serve(service).await;
 }
 
 async fn shutdown_signal() {

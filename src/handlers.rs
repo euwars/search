@@ -29,6 +29,22 @@ pub struct AppState {
     pub stats: Arc<Stats>,
 }
 
+/// Replaces salvo's default error pages (404/405/500…) with an empty body:
+/// no framework fingerprint, no wasted egress. Routing errors are
+/// deterministic per URL, so let the CDN absorb bot scans and broken links;
+/// anything else must not stick in a cache.
+#[handler]
+pub async fn empty_error(res: &mut Response, ctrl: &mut FlowCtrl) {
+    let cache = match res.status_code {
+        Some(StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED) => "public, max-age=3600",
+        _ => "no-store",
+    };
+    res.headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache));
+    res.write_body("").ok();
+    ctrl.skip_rest();
+}
+
 #[handler]
 pub async fn health(depot: &Depot, res: &mut Response) {
     res.headers_mut()
@@ -75,6 +91,10 @@ pub async fn require_key(
         .header::<String>("x-api-key")
         .or_else(|| req.query::<String>("api_key"));
     if provided.as_deref() != Some(expected) {
+        // no-store is load-bearing: the key travels in a header, so a shared
+        // cache would serve this 401 to keyed requests for the same URL.
+        res.headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
         res.status_code(StatusCode::UNAUTHORIZED);
         res.render(Json(json!({ "error": "invalid or missing x-api-key" })));
         ctrl.skip_rest();
@@ -92,17 +112,18 @@ pub async fn search(req: &mut Request, depot: &Depot, res: &mut Response) {
     let mut search_req = match parse_search_request(req).await {
         Ok(parsed) => parsed,
         Err(message) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(Json(json!({ "error": message })));
+            render_bad_request(res, Json(json!({ "error": message })));
             return;
         }
     };
     search_req.normalize_for_upstream(state.config.default_mode);
     if search_req.search_queries.is_empty() {
-        res.status_code(StatusCode::BAD_REQUEST);
-        res.render(Json(json!({
-            "error": "search_queries is required (or provide objective)"
-        })));
+        render_bad_request(
+            res,
+            Json(json!({
+                "error": "search_queries is required (or provide objective)"
+            })),
+        );
         return;
     }
 
@@ -145,6 +166,17 @@ pub async fn search(req: &mut Request, depot: &Depot, res: &mut Response) {
             render_parallel_error(res, err.as_ref());
         }
     }
+}
+
+/// A given URL always fails validation the same way, so let caches hold the
+/// 400 briefly instead of re-asking the origin.
+fn render_bad_request(res: &mut Response, body: Json<Value>) {
+    res.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=300"),
+    );
+    res.status_code(StatusCode::BAD_REQUEST);
+    res.render(body);
 }
 
 fn apply_cache_headers(
