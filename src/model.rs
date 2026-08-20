@@ -33,7 +33,7 @@ pub struct SearchRequest {
     pub mode: Option<SearchMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_chars_total: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing, default)]
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_model: Option<String>,
@@ -124,10 +124,8 @@ impl SearchRequest {
     }
 }
 
-/// `session_id` is deliberately absent: it groups requests for upstream
-/// observability but doesn't change results, and keying on it would give
-/// every user a private cache. It is still forwarded on the miss that
-/// populates an entry.
+/// `session_id` is absent: a shared cache must not join callers onto one
+/// Parallel session, and keying on it would give every user a private entry.
 #[derive(Serialize)]
 struct CanonicalKey<'a> {
     objective: Option<String>,
@@ -218,6 +216,33 @@ fn canonicalize_query(value: &str) -> String {
         .collect();
     tokens.sort();
     tokens.join(" ")
+}
+
+/// Public search body: `results`, plus `warnings` only when non-empty.
+/// Drops Parallel `search_id`, `session_id`, and `usage`.
+pub fn project_search_response(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let value: serde_json::Value =
+        serde_json::from_slice(raw).map_err(|err| format!("invalid JSON from Parallel: {err}"))?;
+    let Some(obj) = value.as_object() else {
+        return Err("invalid JSON from Parallel: expected object".into());
+    };
+    let results = match obj.get("results") {
+        Some(serde_json::Value::Array(items)) => serde_json::Value::Array(items.clone()),
+        Some(_) => return Err("invalid JSON from Parallel: results must be an array".into()),
+        None => serde_json::json!([]),
+    };
+
+    let mut out = serde_json::Map::new();
+    out.insert("results".into(), results);
+    if let Some(warnings) = obj.get("warnings")
+        && let serde_json::Value::Array(items) = warnings
+        && !items.is_empty()
+    {
+        out.insert("warnings".into(), serde_json::Value::Array(items.clone()));
+    }
+
+    serde_json::to_vec(&serde_json::Value::Object(out))
+        .map_err(|err| format!("failed to serialize search response: {err}"))
 }
 
 fn normalize_domains(domains: &mut Vec<String>) {
@@ -315,5 +340,54 @@ mod tests {
         req.normalize_for_upstream(SearchMode::Turbo);
         assert_eq!(req.search_queries, vec!["latest nvidia price"]);
         assert_eq!(req.mode, Some(SearchMode::Turbo));
+    }
+
+    #[test]
+    fn session_id_is_not_sent_upstream() {
+        let req = SearchRequest {
+            search_queries: vec!["apple".into()],
+            session_id: Some("session_secret".into()),
+            mode: Some(SearchMode::Turbo),
+            ..SearchRequest::default()
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("session_id").is_none());
+        assert_eq!(json["search_queries"][0], "apple");
+    }
+
+    #[test]
+    fn project_search_response_keeps_results_and_drops_bookkeeping() {
+        let raw = serde_json::json!({
+            "search_id": "search_abc",
+            "session_id": "session_abc",
+            "usage": [{ "name": "sku_search", "count": 1 }],
+            "warnings": null,
+            "results": [{
+                "url": "https://example.com",
+                "title": "Example",
+                "publish_date": "2026-08-20",
+                "excerpts": ["hello"]
+            }]
+        });
+        let out: serde_json::Value =
+            serde_json::from_slice(&project_search_response(raw.to_string().as_bytes()).unwrap())
+                .unwrap();
+        assert_eq!(out["results"][0]["url"], "https://example.com");
+        assert!(out.get("search_id").is_none());
+        assert!(out.get("session_id").is_none());
+        assert!(out.get("usage").is_none());
+        assert!(out.get("warnings").is_none());
+    }
+
+    #[test]
+    fn project_search_response_keeps_nonempty_warnings() {
+        let raw = serde_json::json!({
+            "results": [],
+            "warnings": [{ "type": "input_validation_warning", "message": "max_results capped" }]
+        });
+        let out: serde_json::Value =
+            serde_json::from_slice(&project_search_response(raw.to_string().as_bytes()).unwrap())
+                .unwrap();
+        assert_eq!(out["warnings"][0]["message"], "max_results capped");
     }
 }

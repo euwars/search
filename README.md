@@ -10,7 +10,9 @@ Three cache layers, cheapest first:
 2. **In-process cache** (per replica) — normalized, deduplicated, byte-capped. Hits are served as pre-serialized bytes: no JSON parsing or re-serialization on the hot path.
 3. **Parallel.ai** — only on a genuine miss. Concurrent identical misses are coalesced into a single upstream call (singleflight), so a traffic spike on one hot query costs one API call, not thousands.
 
-Cache keys are canonicalized so near-identical requests share entries: query case, word order, whitespace, duplicate queries, and domain-list order are all normalized, and `session_id` is deliberately **excluded** from the key (it's forwarded upstream for observability but doesn't change results — keying on it would give every user a private cache).
+Cache keys are canonicalized so near-identical requests share entries: query case, word order, whitespace, duplicate queries, and domain-list order are all normalized. `session_id` is ignored (not forwarded, not cached, not returned) so a shared entry cannot join callers onto one Parallel session.
+
+Responses are `{ "results": [...] }` plus `warnings` only when Parallel sent a non-empty list. `search_id`, `session_id`, and `usage` are stripped before L1.
 
 Also on by default: gzip/brotli response compression, `ETag`/`If-None-Match` 304 revalidation, hit-rate stats at `/health`, and graceful drain on SIGTERM.
 
@@ -22,7 +24,7 @@ POST /v1/search   { "objective": "...", "search_queries": ["..."], "mode": "turb
 GET  /health      → { ok, cache: { entries, bytes, hits, misses, upstream_errors, hit_rate } }
 ```
 
-GET supports: `q`/`search_queries` (repeatable), `objective`, `mode` (turbo|fast|basic|advanced), `max_results`, `max_chars_total`, `max_chars_per_result`, `max_age_seconds`, `after_date`, `include_domains`/`exclude_domains` (repeatable), `location`, `session_id`, `client_model`. POST takes the native Parallel request body. Responses carry `x-cache: HIT|MISS` and `x-cache-key`.
+GET supports: `q`/`search_queries` (repeatable), `objective`, `mode` (turbo|fast|basic|advanced), `max_results`, `max_chars_total`, `max_chars_per_result`, `max_age_seconds`, `after_date`, `include_domains`/`exclude_domains` (repeatable), `location`, `client_model`. POST takes the Parallel search body (`session_id` is accepted and discarded). Responses carry `x-cache: HIT|MISS` and `x-cache-key`.
 
 **Prefer GET from clients** — only GET responses are CDN-cacheable.
 

@@ -214,12 +214,12 @@ fn render_parallel_error(res: &mut Response, err: &ParallelError) {
         .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     match err {
         ParallelError::Upstream { status, body } => {
-            res.status_code(*status);
-            if let Ok(value) = serde_json::from_str::<Value>(body) {
-                res.render(Json(value));
-            } else {
-                res.render(Json(json!({ "error": body })));
+            let (message, ref_id) = public_upstream_error(body);
+            if let Some(ref_id) = ref_id {
+                tracing::warn!(%status, ref_id, "parallel upstream error");
             }
+            res.status_code(*status);
+            res.render(Json(json!({ "error": message })));
         }
         ParallelError::Transport(err) => {
             tracing::error!(error = %err, "parallel transport error");
@@ -335,4 +335,21 @@ fn parse_get_request(req: &mut Request) -> Result<SearchRequest, String> {
 
 fn repeated_query(req: &Request, name: &str) -> Vec<String> {
     req.queries().get_vec(name).cloned().unwrap_or_default()
+}
+
+fn public_upstream_error(body: &str) -> (String, Option<String>) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return ("search origin error".into(), None);
+    };
+    let message = value
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("error").and_then(Value::as_str))
+        .unwrap_or("search origin error")
+        .to_string();
+    let ref_id = value
+        .pointer("/error/ref_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    (message, ref_id)
 }

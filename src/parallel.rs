@@ -3,7 +3,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use reqwest::StatusCode;
 
-use crate::model::SearchRequest;
+use crate::model::{SearchRequest, project_search_response};
 
 #[derive(Clone)]
 pub struct ParallelClient {
@@ -39,8 +39,8 @@ impl ParallelClient {
         }
     }
 
-    /// Returns the upstream response bytes verbatim (validated as JSON) so
-    /// cached entries can be served without re-serialization.
+    /// Returns the public search body (results, optional warnings) as JSON
+    /// bytes so L1 can be served without re-serialization.
     pub async fn search(&self, request: &SearchRequest) -> Result<Bytes, ParallelError> {
         let response = self
             .http
@@ -60,12 +60,10 @@ impl ParallelClient {
             });
         }
 
-        if let Err(err) = serde_json::from_slice::<serde::de::IgnoredAny>(&body) {
-            return Err(ParallelError::Upstream {
-                status: StatusCode::BAD_GATEWAY,
-                body: format!("invalid JSON from Parallel: {err}"),
-            });
-        }
-        Ok(body)
+        let public = project_search_response(&body).map_err(|err| ParallelError::Upstream {
+            status: StatusCode::BAD_GATEWAY,
+            body: err,
+        })?;
+        Ok(Bytes::from(public))
     }
 }
