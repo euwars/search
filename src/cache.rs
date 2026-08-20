@@ -1,19 +1,34 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use moka::Expiry;
 use moka::future::Cache;
 
 pub struct CachedSearch {
     pub body: Bytes,
     pub etag: String,
+    pub ttl: Duration,
+    created: Instant,
 }
 
 impl CachedSearch {
-    fn new(body: Bytes) -> Self {
+    fn new(body: Bytes, ttl: Duration) -> Self {
         let etag = format!("\"{}\"", &blake3::hash(&body).to_hex()[..16]);
-        Self { body, etag }
+        Self {
+            body,
+            etag,
+            ttl,
+            created: Instant::now(),
+        }
+    }
+
+    /// Time left before this entry expires — what downstream caches may hold
+    /// it for. Using the full TTL on every hit would stack origin and CDN
+    /// lifetimes into up to double the intended staleness.
+    pub fn remaining(&self) -> Duration {
+        self.ttl.saturating_sub(self.created.elapsed())
     }
 
     fn weight(&self, key: &str) -> u32 {
@@ -23,26 +38,34 @@ impl CachedSearch {
     }
 }
 
+/// Each entry carries its own TTL (volatile queries expire sooner).
+struct PerEntryTtl;
+
+impl Expiry<String, Arc<CachedSearch>> for PerEntryTtl {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &Arc<CachedSearch>,
+        _created_at: Instant,
+    ) -> Option<Duration> {
+        Some(value.ttl)
+    }
+}
+
 #[derive(Clone)]
 pub struct SearchCache {
     inner: Cache<String, Arc<CachedSearch>>,
-    ttl: Duration,
 }
 
 impl SearchCache {
-    pub fn new(max_bytes: u64, ttl: Duration) -> Self {
+    pub fn new(max_bytes: u64) -> Self {
         Self {
             inner: Cache::builder()
                 .max_capacity(max_bytes)
                 .weigher(|key: &String, value: &Arc<CachedSearch>| value.weight(key))
-                .time_to_live(ttl)
+                .expire_after(PerEntryTtl)
                 .build(),
-            ttl,
         }
-    }
-
-    pub fn ttl(&self) -> Duration {
-        self.ttl
     }
 
     pub fn entry_count(&self) -> u64 {
@@ -56,6 +79,7 @@ impl SearchCache {
     pub async fn get_or_fetch<F, Fut, E>(
         &self,
         key: String,
+        ttl: Duration,
         fetch: F,
     ) -> Result<(Arc<CachedSearch>, bool), Arc<E>>
     where
@@ -73,7 +97,7 @@ impl SearchCache {
             .inner
             .try_get_with(key, async move {
                 fetched_flag.store(true, Ordering::Relaxed);
-                Ok(Arc::new(CachedSearch::new(fetch().await?)))
+                Ok(Arc::new(CachedSearch::new(fetch().await?, ttl)))
             })
             .await?;
 

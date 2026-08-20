@@ -33,8 +33,8 @@ pub struct SearchRequest {
     pub mode: Option<SearchMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_chars_total: Option<i64>,
-    #[serde(skip_serializing, default)]
-    pub session_id: Option<String>,
+    // No session_id field: serde ignores unknown fields, so clients may still
+    // send it — it is discarded, never forwarded, and never part of the key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,6 +202,59 @@ impl SearchRequest {
     }
 }
 
+/// Token signals for time-sensitive queries whose answers go stale in
+/// minutes, not hours. English-only heuristic — an explicit client
+/// `max_age_seconds` is the reliable override for everything else.
+// Must stay sorted: is_volatile uses binary_search.
+const VOLATILE_TOKENS: &[&str] = &[
+    "bitcoin",
+    "breaking",
+    "crypto",
+    "current",
+    "currently",
+    "ethereum",
+    "forecast",
+    "headlines",
+    "latest",
+    "live",
+    "news",
+    "now",
+    "odds",
+    "price",
+    "prices",
+    "rate",
+    "rates",
+    "score",
+    "scores",
+    "stock",
+    "stocks",
+    "temperature",
+    "today",
+    "tomorrow",
+    "tonight",
+    "traffic",
+    "trending",
+    "weather",
+];
+
+impl SearchRequest {
+    /// True when any query or the objective contains a volatility signal.
+    pub fn is_volatile(&self) -> bool {
+        self.search_queries
+            .iter()
+            .map(String::as_str)
+            .chain(self.objective.as_deref())
+            .any(|text| {
+                text.split(|c: char| !c.is_ascii_alphanumeric())
+                    .any(|token| {
+                        VOLATILE_TOKENS
+                            .binary_search(&token.to_ascii_lowercase().as_str())
+                            .is_ok()
+                    })
+            })
+    }
+}
+
 pub fn collapse_ws(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -298,12 +351,14 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_ignores_session_id() {
-        let mut a = req(&["nike"]);
-        let mut b = req(&["nike"]);
-        a.session_id = Some("user-1".into());
-        b.session_id = Some("user-2".into());
-        assert_eq!(a.cache_key(), b.cache_key());
+    fn session_id_is_accepted_and_ignored() {
+        let parsed: SearchRequest = serde_json::from_str(
+            r#"{"search_queries":["apple"],"session_id":"user-1","mode":"turbo"}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.search_queries, vec!["apple"]);
+        let json = serde_json::to_value(&parsed).unwrap();
+        assert!(json.get("session_id").is_none());
     }
 
     #[test]
@@ -343,19 +398,6 @@ mod tests {
     }
 
     #[test]
-    fn session_id_is_not_sent_upstream() {
-        let req = SearchRequest {
-            search_queries: vec!["apple".into()],
-            session_id: Some("session_secret".into()),
-            mode: Some(SearchMode::Turbo),
-            ..SearchRequest::default()
-        };
-        let json = serde_json::to_value(&req).unwrap();
-        assert!(json.get("session_id").is_none());
-        assert_eq!(json["search_queries"][0], "apple");
-    }
-
-    #[test]
     fn project_search_response_keeps_results_and_drops_bookkeeping() {
         let raw = serde_json::json!({
             "search_id": "search_abc",
@@ -377,6 +419,29 @@ mod tests {
         assert!(out.get("session_id").is_none());
         assert!(out.get("usage").is_none());
         assert!(out.get("warnings").is_none());
+    }
+
+    #[test]
+    fn volatile_tokens_stay_sorted_for_binary_search() {
+        assert!(VOLATILE_TOKENS.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn detects_volatile_queries() {
+        assert!(req(&["tokyo weather"]).is_volatile());
+        assert!(req(&["Bitcoin, price!"]).is_volatile());
+        assert!(req(&["nvidia STOCK"]).is_volatile());
+        let mut by_objective = req(&["nvidia"]);
+        by_objective.objective = Some("latest nvidia earnings".into());
+        assert!(by_objective.is_volatile());
+    }
+
+    #[test]
+    fn evergreen_queries_are_not_volatile() {
+        assert!(!req(&["how to make sourdough"]).is_volatile());
+        assert!(!req(&["rust async tutorial"]).is_volatile());
+        // token match, not substring: "priceless" must not trip "price"
+        assert!(!req(&["priceless artworks history"]).is_volatile());
     }
 
     #[test]

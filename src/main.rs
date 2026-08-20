@@ -55,7 +55,7 @@ async fn run() {
             config.parallel_api_key.clone(),
             config.request_timeout,
         ),
-        cache: SearchCache::new(config.cache_max_bytes, config.cache_ttl),
+        cache: SearchCache::new(config.cache_max_bytes),
         stats: Arc::new(Stats::default()),
         config: config.clone(),
     };

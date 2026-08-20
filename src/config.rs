@@ -35,6 +35,7 @@ pub struct Config {
     pub parallel_base_url: String,
     pub default_mode: SearchMode,
     pub cache_ttl: Duration,
+    pub cache_ttl_volatile: Duration,
     pub cache_max_bytes: u64,
     pub search_api_key: Option<String>,
     pub request_timeout: Duration,
@@ -59,6 +60,10 @@ impl Config {
             .unwrap_or(SearchMode::Turbo);
 
         let cache_ttl = Duration::from_secs(parse_u64_env("CACHE_TTL_SECS", 300)?);
+        // Time-sensitive queries (weather, prices, scores…) must not live as
+        // long as evergreen ones, whatever the main TTL is cranked up to.
+        let cache_ttl_volatile =
+            Duration::from_secs(parse_u64_env("CACHE_TTL_VOLATILE_SECS", 120)?).min(cache_ttl);
         let cache_max_bytes = parse_u64_env("CACHE_MAX_BYTES", 256 * 1024 * 1024)?;
         let request_timeout = Duration::from_secs(parse_u64_env("REQUEST_TIMEOUT_SECS", 30)?);
         let search_api_key = env::var("SEARCH_API_KEY").ok().filter(|s| !s.is_empty());
@@ -80,6 +85,7 @@ impl Config {
                 .unwrap_or_else(|_| "https://api.parallel.ai".into()),
             default_mode,
             cache_ttl,
+            cache_ttl_volatile,
             cache_max_bytes,
             search_api_key,
             request_timeout,

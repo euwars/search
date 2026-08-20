@@ -28,6 +28,10 @@ GET supports: `q`/`search_queries` (repeatable), `objective`, `mode` (turbo|fast
 
 **Prefer GET from clients** — only GET responses are CDN-cacheable.
 
+### Freshness
+
+Each entry gets its own TTL. Queries containing time-sensitive signals (weather, prices, scores, news, "today"…) use the short `CACHE_TTL_VOLATILE_SECS`; everything else uses `CACHE_TTL_SECS`. Clients can tighten further with `max_age_seconds`: it caps the entry's TTL, and `max_age_seconds=0` bypasses every cache layer for a guaranteed-fresh Parallel call (billed every time — use sparingly). The `Cache-Control: max-age` sent downstream is the entry's *remaining* lifetime, so CDN and origin TTLs never stack.
+
 ## Configuration (env vars)
 
 | Variable | Default | Notes |
@@ -35,6 +39,7 @@ GET supports: `q`/`search_queries` (repeatable), `objective`, `mode` (turbo|fast
 | `PARALLEL_API_KEY` | *(required)* | Parallel.ai API key |
 | `SEARCH_API_KEY` | *(unset)* | If set, clients must send `x-api-key` |
 | `CACHE_TTL_SECS` | `300` | Cache TTL; the biggest cost lever (see below) |
+| `CACHE_TTL_VOLATILE_SECS` | `120` | TTL for time-sensitive queries (weather, prices, scores, news…), clamped to `CACHE_TTL_SECS` |
 | `CACHE_MAX_BYTES` | `268435456` (256 MiB) | In-process cache size cap, by response bytes |
 | `CDN_CACHE` | auto | `public`, `private`, or `off`. Auto: `public` without `SEARCH_API_KEY`, `private` with it |
 | `DEFAULT_MODE` | `turbo` | Mode when the client doesn't pick one |

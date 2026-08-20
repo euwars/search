@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use salvo::http::HeaderValue;
 use salvo::http::header::{CACHE_CONTROL, CONTENT_TYPE, ETAG, IF_NONE_MATCH};
@@ -127,16 +128,37 @@ pub async fn search(req: &mut Request, depot: &Depot, res: &mut Response) {
         return;
     }
 
-    let key = search_req.cache_key();
+    let ttl = effective_ttl(&state.config, &search_req);
     let parallel = state.parallel.clone();
+
+    // max_age_seconds=0 is an explicit freshness demand: skip every cache
+    // layer, hit Parallel, and keep the response out of downstream caches.
+    if ttl.is_zero() {
+        state.stats.misses.fetch_add(1, Ordering::Relaxed);
+        match parallel.search(&search_req).await {
+            Ok(body) => {
+                res.headers_mut()
+                    .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+                res.headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                res.write_body(body).ok();
+            }
+            Err(err) => {
+                state.stats.upstream_errors.fetch_add(1, Ordering::Relaxed);
+                render_parallel_error(res, &err);
+            }
+        }
+        return;
+    }
+
+    let key = search_req.cache_key();
     let if_none_match = req.headers().get(IF_NONE_MATCH).cloned();
 
     match state
         .cache
-        .get_or_fetch(
-            key.clone(),
-            || async move { parallel.search(&search_req).await },
-        )
+        .get_or_fetch(key.clone(), ttl, || async move {
+            parallel.search(&search_req).await
+        })
         .await
     {
         Ok((entry, hit)) => {
@@ -146,7 +168,7 @@ pub async fn search(req: &mut Request, depot: &Depot, res: &mut Response) {
                 &state.stats.misses
             };
             counter.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!(cache_key = %key, hit, "served search");
+            tracing::debug!(cache_key = %key, hit, ttl_secs = ttl.as_secs(), "served search");
             apply_cache_headers(res, state, &entry, hit, &key);
 
             let revalidated = if_none_match
@@ -179,6 +201,27 @@ fn render_bad_request(res: &mut Response, body: Json<Value>) {
     res.render(body);
 }
 
+/// Client `max_age_seconds` caps the class TTL (volatile vs. default);
+/// zero means bypass caching entirely.
+fn effective_ttl(config: &Config, req: &SearchRequest) -> Duration {
+    let base = if req.is_volatile() {
+        config.cache_ttl_volatile
+    } else {
+        config.cache_ttl
+    };
+    let client_cap = req
+        .advanced_settings
+        .as_ref()
+        .and_then(|s| s.fetch_policy.as_ref())
+        .and_then(|f| f.max_age_seconds)
+        .filter(|secs| *secs >= 0)
+        .map(|secs| Duration::from_secs(secs as u64));
+    match client_cap {
+        Some(cap) => base.min(cap),
+        None => base,
+    }
+}
+
 fn apply_cache_headers(
     res: &mut Response,
     state: &AppState,
@@ -186,12 +229,15 @@ fn apply_cache_headers(
     hit: bool,
     key: &str,
 ) {
-    let ttl = state.cache.ttl().as_secs();
+    // Advertise the entry's remaining lifetime, not its full TTL, so CDN and
+    // origin lifetimes don't stack into double staleness.
+    let max_age = entry.remaining().as_secs();
+    let swr = entry.ttl.as_secs();
     let value = match state.config.cdn_cache {
         CdnCacheMode::Public => {
-            format!("public, max-age={ttl}, stale-while-revalidate={ttl}, stale-if-error=3600")
+            format!("public, max-age={max_age}, stale-while-revalidate={swr}, stale-if-error=3600")
         }
-        CdnCacheMode::Private => format!("private, max-age={ttl}"),
+        CdnCacheMode::Private => format!("private, max-age={max_age}"),
         CdnCacheMode::Off => "no-store".to_string(),
     };
     if let Ok(header) = HeaderValue::from_str(&value) {
@@ -236,7 +282,6 @@ struct SearchQuery {
     search_queries: Vec<String>,
     mode: Option<String>,
     max_chars_total: Option<i64>,
-    session_id: Option<String>,
     client_model: Option<String>,
     location: Option<String>,
     max_results: Option<i64>,
@@ -327,7 +372,6 @@ fn parse_get_request(req: &mut Request) -> Result<SearchRequest, String> {
         search_queries,
         mode,
         max_chars_total: query.max_chars_total,
-        session_id: query.session_id,
         client_model: query.client_model,
         advanced_settings,
     })
